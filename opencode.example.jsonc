@@ -1,0 +1,37 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // 复制本文件为 opencode.jsonc 并根据你的环境修改路径/密钥
+  "plugin": [
+    "./plugins/vision.ts"
+  ],
+  "mcp": {
+    "paper-search-mcp": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "uv",
+        "run",
+        "--with",
+        "paper-search-mcp",
+        "python",
+        "-m",
+        "paper_search_mcp.server"
+      ],
+      "environment": {
+        "PAPER_SEARCH_MCP_ENV_FILE": "C:\\Users\\<用户名>\\.config\\paper-search-mcp\\.env"
+      }
+    },
+    "cnki-mcp": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "cmd",
+        "/c",
+        "cd /d <你的仓库路径>\\mcp\\cnki-mcp && .venv\\Scripts\\python.exe -m cnki_mcp.server"
+      ]
+    }
+  },
+  "experimental": {
+    "mcp_timeout": 90000
+  }
+}
