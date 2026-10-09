@@ -1,6 +1,19 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
-import type { Part } from "@opencode-ai/sdk"
+// vision.ts — opencode 2.x (v2 插件 API)
+//
+// 迁移说明（v1 → v2）：
+// - v1 形态是 `export const Vision: Plugin = async () => ({ tool: {...}, "chat.params": ..., "experimental.chat.messages.transform": ... })`
+//   v1 插件在 opencode 2.0 上无法加载（"Plugin must export a default definition with an id and an effect or setup function"）。
+// - v2 形态：`export default { id, setup }`，工具通过 `ctx.tool.transform((tools) => tools.add({...}))` 注册，
+//   参数用 JSON Schema（不再是 zod），execute(input, context) 返回 { content }。
+// - 保留：6 个本地视觉/文本工具（识图/OCR/表格/图表/PDF/本地问答）+ Ollama 自动拉起/重启/重试保障 + 看门狗。
+// - 移除：chat.params / experimental.chat.messages.transform（v2 无对应钩子，图片附件由模型自身能力处理）。
+//
+// 路径均已参数化（均可通过环境变量覆盖，或直接修改下面的默认值）：
+//   OLLAMA_EXE           Ollama 可执行文件（Windows 常见: C:\Users\<用户名>\AppData\Local\Programs\Ollama\ollama.exe）
+//   OLLAMA_MODELS_DIR    Ollama 模型目录（留空用默认）
+//   OPENCODE_VISION_TMP  临时文件目录
+//   OLLAMA_PROXY_SCRIPT  OpenAI /v1 → Ollama /api 中转代理脚本（可选，缺失时跳过代理仅保留视觉工具）
+
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import * as fs from "node:fs"
@@ -8,14 +21,12 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434"
-// 本插件路径已参数化，避免绑定单台机器：均可通过环境变量覆盖，或直接修改下面的默认值
-const OLLAMA_EXE = process.env.OLLAMA_EXE ?? "ollama" // Windows 常见: C:\Users\<用户名>\AppData\Local\Programs\Ollama\ollama.exe
-const OLLAMA_MODELS_DIR = process.env.OLLAMA_MODELS_DIR ?? "" // 留空用 Ollama 默认模型目录
+const OLLAMA_EXE = process.env.OLLAMA_EXE ?? "ollama"
+const OLLAMA_MODELS_DIR = process.env.OLLAMA_MODELS_DIR ?? ""
 const TMP_DIR = process.env.OPENCODE_VISION_TMP ?? path.join(os.tmpdir(), "opencode-vision")
 const ERROR_LOG = path.join(TMP_DIR, "vision-error.log")
 const WATCHDOG_SCRIPT = path.join(TMP_DIR, "vision-watchdog.ps1")
 const WATCHDOG_PID = path.join(TMP_DIR, "vision-watchdog.pid")
-// OpenAI 兼容 /v1 → Ollama /api 中转代理（强制 think:false 关闭思考链，保聊天记忆）
 const PROXY_PORT = 11500
 const PROXY_HOST = `http://127.0.0.1:${PROXY_PORT}`
 const PROXY_SCRIPT = process.env.OLLAMA_PROXY_SCRIPT ?? path.join(TMP_DIR, "ollama-proxy.mjs")
@@ -27,6 +38,7 @@ const MAX_SIDE = 1024
 const NUM_CTX = 4096
 const NUM_PREDICT_DEFAULT = 1024
 const NUM_PREDICT_SHORT = 512
+
 const DEFAULT_QUESTION =
   "请用中文详细描述这张图片的内容，包括：图片类型、主体内容、坐标轴或图例（如有）、文字内容（如有，请逐字读出）、关键特征。"
 const PROMPT_OCR =
@@ -45,26 +57,27 @@ const POWERSHELL = process.env.SystemRoot
   : "powershell.exe"
 
 const visionCache = new Map<string, string>()
-let modelSupportsImage = false
-let currentModelName = ""
-const VISION_SKIP_MODELS = ["mimo", "mimo-v2.5", "mimo-v2.5-free"]
+
+// ---------- 基础 ----------
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function runPowerShell(script: string): { ok: boolean; stdout: string; stderr: string } {
-  const res = spawnSync(POWERSHELL, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    encoding: "utf8",
-    timeout: 120_000,
-    windowsHide: true,
-  })
+  const res = spawnSync(
+    POWERSHELL,
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+    { encoding: "utf8", timeout: 120_000, windowsHide: true },
+  )
   return {
     ok: res.status === 0,
     stdout: (res.stdout || "") as string,
     stderr: (res.stderr || "") as string,
   }
 }
+
+// ---------- Ollama 生命周期 ----------
 
 async function ollamaAlive(): Promise<boolean> {
   try {
@@ -115,9 +128,7 @@ function watchdogAlive(): boolean {
 function startWatchdog(): void {
   if (watchdogAlive()) return
   try {
-    if (!fs.existsSync(TMP_DIR)) {
-      fs.mkdirSync(TMP_DIR, { recursive: true })
-    }
+    if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
     fs.writeFileSync(
       WATCHDOG_SCRIPT,
       `while ($true) { Start-Sleep -Seconds 30; $oc = Get-Process -Name 'OpenCode','opencode' -ErrorAction SilentlyContinue; if (-not $oc) { if (Test-Path '${PROXY_PID}') { $pp = Get-Content '${PROXY_PID}'; Stop-Process -Id $pp -Force -ErrorAction SilentlyContinue }; Get-Process -Name 'ollama','llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force; exit } }`,
@@ -127,9 +138,7 @@ function startWatchdog(): void {
       `$p = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','${WATCHDOG_SCRIPT}'; if ($p) { $p.Id } else { '' }; exit 0`,
     )
     const pid = res.stdout.trim()
-    if (res.ok && pid) {
-      fs.writeFileSync(WATCHDOG_PID, pid, "utf8")
-    }
+    if (res.ok && pid) fs.writeFileSync(WATCHDOG_PID, pid, "utf8")
   } catch {
     // 看门狗失败不影响主流程
   }
@@ -140,7 +149,7 @@ function stopOllama(): void {
   runPowerShell("Get-Process -Name ollama,llama-server -ErrorAction SilentlyContinue | Stop-Process -Force; exit 0")
 }
 
-// ---------- Ollama /v1 → /api 中转代理（强制 think:false，保聊天记忆） ----------
+// ---------- OpenAI 兼容 /v1 → Ollama /api 中转代理 ----------
 
 function proxyAlive(): boolean {
   try {
@@ -157,18 +166,14 @@ function proxyAlive(): boolean {
 function startProxy(): void {
   if (proxyAlive()) return
   try {
-    if (!fs.existsSync(TMP_DIR)) {
-      fs.mkdirSync(TMP_DIR, { recursive: true })
-    }
+    if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
     const res = runPowerShell(
       `$p = Start-Process node -WindowStyle Hidden -PassThru -ArgumentList '${PROXY_SCRIPT}'; if ($p) { $p.Id } else { '' }; exit 0`,
     )
     const pid = res.stdout.trim()
-    if (res.ok && pid) {
-      fs.writeFileSync(PROXY_PID, pid, "utf8")
-    }
+    if (res.ok && pid) fs.writeFileSync(PROXY_PID, pid, "utf8")
   } catch {
-    // 代理启动失败不影响主流程（聊天仍会报连接错误而非假成功）
+    // ignore
   }
 }
 
@@ -176,9 +181,7 @@ function stopProxy(): void {
   try {
     if (fs.existsSync(PROXY_PID)) {
       const pid = parseInt(fs.readFileSync(PROXY_PID, "utf8").trim(), 10)
-      if (pid) {
-        runPowerShell(`Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue; exit 0`)
-      }
+      if (pid) runPowerShell(`Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue; exit 0`)
       fs.unlinkSync(PROXY_PID)
     }
   } catch {
@@ -208,11 +211,13 @@ async function waitForProxy(timeoutMs: number): Promise<boolean> {
 }
 
 async function ensureProxy(): Promise<void> {
-  if (await proxyUp()) return
-  startProxy()
-  const ready = await waitForProxy(15_000)
-  if (!ready) {
-    throw new Error(`Ollama /v1 代理启动失败：无法连接 ${PROXY_HOST}，请检查 ${PROXY_SCRIPT}（可通过环境变量 OLLAMA_PROXY_SCRIPT 指定）与 node 是否可用`)
+  try {
+    if (await proxyUp()) return
+    if (!fs.existsSync(PROXY_SCRIPT)) return // 代理脚本不存在则跳过，不影响视觉工具
+    startProxy()
+    await waitForProxy(15_000)
+  } catch {
+    // 代理只服务本地 ollama 聊天，失败不影响视觉工具
   }
 }
 
@@ -232,27 +237,23 @@ async function restartOllama(): Promise<void> {
   await sleep(3000)
   startOllama()
   const ready = await waitForOllama(60_000)
-  if (!ready) {
-    throw new Error("Ollama 服务重启失败：无法连接 127.0.0.1:11434")
-  }
+  if (!ready) throw new Error(`Ollama 服务重启失败：无法连接 ${OLLAMA_HOST}`)
   await ensureProxy()
 }
 
 function appendErrorLog(detail: string): void {
   try {
-    if (!fs.existsSync(TMP_DIR)) {
-      fs.mkdirSync(TMP_DIR, { recursive: true })
-    }
+    if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
     fs.appendFileSync(ERROR_LOG, detail, "utf8")
   } catch {
-    // 日志失败不影响主流程
+    // ignore
   }
 }
 
+// ---------- 图片缩放（PowerShell + System.Drawing） ----------
+
 function shrinkImage(imagePath: string): { b64: string; width: number; height: number } {
-  if (!fs.existsSync(TMP_DIR)) {
-    fs.mkdirSync(TMP_DIR, { recursive: true })
-  }
+  if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
   const tmpDir = fs.mkdtempSync(path.join(TMP_DIR, "vision-"))
   const inFile = path.join(tmpDir, "in.json")
   const outFile = path.join(tmpDir, "out.json")
@@ -269,7 +270,7 @@ function shrinkImage(imagePath: string): { b64: string; width: number; height: n
     `    $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder`,
     `    $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bi))`,
     `    $convTmp = [System.IO.Path]::GetTempFileName() + '.png'`,
-    `    $fs = [IO.File]::Create($convTmp); $enc.Save($fs); $fs.Close()`,
+    `    $fstream = [IO.File]::Create($convTmp); $enc.Save($fstream); $fstream.Close()`,
     `    $src = [System.Drawing.Image]::FromFile($convTmp)`,
     `    Remove-Item $convTmp -Force -ErrorAction SilentlyContinue`,
     `  }`,
@@ -297,14 +298,12 @@ function shrinkImage(imagePath: string): { b64: string; width: number; height: n
   const res = runPowerShell(script)
   if (!res.ok) {
     fs.rmSync(tmpDir, { recursive: true, force: true })
-    const detail = `${new Date().toISOString()} shrinkImage 失败 exit=${String(res.status)} stderr=${res.stderr.trim()} stdout=${res.stdout.trim()}\n`
-    appendErrorLog(detail)
+    appendErrorLog(`${new Date().toISOString()} shrinkImage 失败 exit=${res.status} stderr=${res.stderr.trim()} stdout=${res.stdout.trim()}\n`)
     throw new Error(`图片处理失败：${res.stderr.trim() || res.stdout.trim() || "PowerShell 退出码异常"}`)
   }
   if (!fs.existsSync(outFile)) {
     fs.rmSync(tmpDir, { recursive: true, force: true })
-    const detail = `${new Date().toISOString()} shrinkImage 未生成 out.json stderr=${res.stderr.trim()} stdout=${res.stdout.trim()}\n`
-    appendErrorLog(detail)
+    appendErrorLog(`${new Date().toISOString()} shrinkImage 未生成 out.json stderr=${res.stderr.trim()} stdout=${res.stdout.trim()}\n`)
     throw new Error(`图片处理失败：未生成图片数据（PowerShell 输出：${res.stdout.trim() || res.stderr.trim() || "无"}）`)
   }
   const raw = fs.readFileSync(outFile, "utf8")
@@ -314,7 +313,9 @@ function shrinkImage(imagePath: string): { b64: string; width: number; height: n
   return { b64: parsed.b64, width: parsed.width, height: parsed.height }
 }
 
-async function postGenerate(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+// ---------- 调用 Ollama ----------
+
+async function postGenerate(body: Record<string, any>): Promise<Record<string, any>> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
   try {
@@ -324,18 +325,14 @@ async function postGenerate(body: Record<string, unknown>): Promise<Record<strin
       body: JSON.stringify(body),
       signal: controller.signal,
     })
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`)
-    }
-    const text = await res.text()
-    const parsed = JSON.parse(text)
-    return parsed as Record<string, unknown>
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return JSON.parse(await res.text())
   } finally {
     clearTimeout(timer)
   }
 }
 
-function isGoodResponse(resp: Record<string, unknown> | null | undefined): boolean {
+function isGoodResponse(resp: Record<string, any> | null | undefined): boolean {
   if (!resp || typeof resp !== "object") return false
   if (resp.error) return false
   if (resp.done !== true) return false
@@ -345,7 +342,7 @@ function isGoodResponse(resp: Record<string, unknown> | null | undefined): boole
   return true
 }
 
-async function generateWithRetry(body: Record<string, unknown>, maxPredict = 4096): Promise<string> {
+async function generateWithRetry(body: Record<string, any>, maxPredict = 4096): Promise<string> {
   let lastError = ""
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
@@ -353,7 +350,7 @@ async function generateWithRetry(body: Record<string, unknown>, maxPredict = 409
       if (isGoodResponse(resp)) {
         const text = String(resp.response ?? "")
         const doneReason = String(resp.done_reason ?? "stop")
-        const opts = body.options as Record<string, unknown>
+        const opts = body.options as Record<string, any>
         const curPredict = Number(opts.num_predict ?? NUM_PREDICT_DEFAULT)
         if (doneReason === "length" && curPredict < maxPredict) {
           const next = Math.min(curPredict * 2, maxPredict)
@@ -368,11 +365,8 @@ async function generateWithRetry(body: Record<string, unknown>, maxPredict = 409
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err)
     }
-    if (attempt === 1) {
-      await sleep(2000)
-    } else if (attempt === 2) {
-      await restartOllama()
-    }
+    if (attempt === 1) await sleep(2000)
+    else if (attempt === 2) await restartOllama()
   }
   throw new Error(`视觉模型连续 ${MAX_ATTEMPTS} 次调用失败，最后一次：${lastError}（已自动重启 Ollama 服务，请重试）`)
 }
@@ -382,7 +376,13 @@ function estimateImageTokens(width: number, height: number): number {
   return Math.min(patches, 16_000)
 }
 
-async function recognizeImage(imagePath: string, prompt: string, tag = "图片识别", numPredict = NUM_PREDICT_DEFAULT): Promise<string> {
+async function recognizeImage(
+  imagePath: string,
+  prompt: string,
+  tag = "图片识别",
+  numPredict = NUM_PREDICT_DEFAULT,
+): Promise<string> {
+  if (!fs.existsSync(imagePath)) throw new Error(`图片文件不存在：${imagePath}`)
   const cacheKey = `${imagePath}\u0000${prompt}`
   const cached = visionCache.get(cacheKey)
   if (cached) return cached
@@ -405,10 +405,21 @@ async function recognizeImage(imagePath: string, prompt: string, tag = "图片�
   return result
 }
 
+async function askLocal(prompt: string): Promise<string> {
+  await ensureOllama()
+  return generateWithRetry({
+    model: MODEL_DEFAULT,
+    prompt,
+    stream: false,
+    think: false,
+    options: { num_predict: NUM_PREDICT_DEFAULT, num_ctx: NUM_CTX },
+  })
+}
+
+// ---------- PDF → PNG（系统内置 Windows.Data.Pdf） ----------
+
 function pdfToPng(pdfPath: string, pageIndex: number): { png: string; pageCount: number } {
-  if (!fs.existsSync(TMP_DIR)) {
-    fs.mkdirSync(TMP_DIR, { recursive: true })
-  }
+  if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
   const hash = createHash("sha1").update(pdfPath + "\u0000" + pageIndex).digest("hex").slice(0, 16)
   const outPng = path.join(TMP_DIR, `pdf-${hash}-p${pageIndex + 1}.png`)
   const countFile = path.join(TMP_DIR, `pdf-${hash}.count`)
@@ -423,7 +434,6 @@ function pdfToPng(pdfPath: string, pageIndex: number): { png: string; pageCount:
     `  [Windows.Data.Pdf.PdfDocument,Windows.Data.Pdf,ContentType=WindowsRuntime] | Out-Null`,
     `  [Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null`,
     `  [Windows.Storage.Streams.InMemoryRandomAccessStream,Windows.Storage.Streams,ContentType=WindowsRuntime] | Out-Null`,
-    `  [Windows.Storage.Streams.RandomAccessStreamOverStream,Windows.Storage.Streams,ContentType=WindowsRuntime] | Out-Null`,
     `  [Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics.Imaging,ContentType=WindowsRuntime] | Out-Null`,
     `  [Windows.Graphics.Imaging.BitmapEncoder,Windows.Graphics.Imaging,ContentType=WindowsRuntime] | Out-Null`,
     `  [Windows.Graphics.Imaging.PixelDataProvider,Windows.Graphics.Imaging,ContentType=WindowsRuntime] | Out-Null`,
@@ -459,290 +469,132 @@ function pdfToPng(pdfPath: string, pageIndex: number): { png: string; pageCount:
   ].join("; ")
   const res = runPowerShell(script)
   if (!res.ok || !fs.existsSync(outPng)) {
-    const detail = `${new Date().toISOString()} pdfToPng 失败 pdf=${pdfPath} page=${pageIndex + 1} stderr=${res.stderr.trim()}\n`
-    appendErrorLog(detail)
+    appendErrorLog(`${new Date().toISOString()} pdfToPng 失败 pdf=${pdfPath} page=${pageIndex + 1} stderr=${res.stderr.trim()}\n`)
     throw new Error(`PDF 渲染失败：${res.stderr.trim() || res.stdout.trim() || "未知错误"}（当前系统可能不支持 Windows.Data.Pdf）`)
   }
   const pageCount = fs.existsSync(countFile) ? parseInt(fs.readFileSync(countFile, "utf8").trim(), 10) || 1 : 1
   return { png: outPng, pageCount }
 }
 
-async function askLocal(prompt: string): Promise<string> {
-  await ensureOllama()
-  const body = {
-    model: MODEL_DEFAULT,
-    prompt,
-    stream: false,
-    think: false,
-    options: { num_predict: NUM_PREDICT_DEFAULT, num_ctx: NUM_CTX },
-  }
-  return generateWithRetry(body)
+// ---------- 工具定义（v2：JSON Schema + tools.add） ----------
+
+const S = (description: string) => ({ type: "string", description })
+
+type ToolDef = {
+  name: string
+  description: string
+  input: Record<string, any>
+  execute: (input: any, context: any) => Promise<{ content: string }>
 }
 
-function dataUrlToFile(dataUrl: string): string | null {
-  const m = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl)
-  if (!m) return null
-  try {
-    const mime = m[1].toLowerCase()
-    const ext = mime.includes("png") ? "png" : mime.includes("jpeg") ? "jpg" : mime.includes("gif") ? "gif" : mime.includes("webp") ? "webp" : mime === "application/pdf" ? "pdf" : "bin"
-    const file = path.join(TMP_DIR, `drag-${createHash("sha1").update(dataUrl).digest("hex").slice(0, 16)}.${ext}`)
-    if (!fs.existsSync(file)) {
-      if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
-      fs.writeFileSync(file, Buffer.from(m[2], "base64"))
-    }
-    return file
-  } catch {
-    return null
-  }
-}
-
-function filePathFromPart(part: Part): string | null {
-  if (part.type !== "file") return null
-  const source = part as unknown as { source?: { path?: string }; url?: string }
-  if (source.source?.path) return source.source.path
-  if (source.url) {
-    const u = source.url
-    if (u.startsWith("data:")) return dataUrlToFile(u)
-    const f = u.replace(/^file:\/\/\//, "").replace(/^file:\/\//, "")
-    if (f) return f
-  }
-  return null
-}
-
-function imagePathFromPart(part: Part): string | null {
-  if (part.type !== "file") return null
-  const mime = (part.mime || "").toLowerCase()
-  if (!mime.startsWith("image/")) return null
-  return filePathFromPart(part)
-}
-
-function pdfPathFromPart(part: Part): string | null {
-  if (part.type !== "file") return null
-  const mime = (part.mime || "").toLowerCase()
-  if (mime !== "application/pdf") return null
-  return filePathFromPart(part)
-}
-
-export const Vision: Plugin = async () => {
-  return {
-    dispose: async () => {
-      stopOllama()
-      try {
-        if (fs.existsSync(TMP_DIR)) {
-          for (const f of fs.readdirSync(TMP_DIR)) {
-            if (f.startsWith("drag-")) fs.unlinkSync(path.join(TMP_DIR, f))
-          }
-        }
-      } catch {
-        /* ignore */
-      }
+function buildTools(): ToolDef[] {
+  return [
+    {
+      name: "image_vision",
+      description:
+        "让当前模型看懂图片：读取本地图片文件，用本地视觉模型（Ollama + qwen3.5）识别内容并返回文字描述。内置稳定性保障：Ollama 服务未运行会自动启动，调用失败会自动重启服务并重试。适用于：论文图表、截图、照片、示意图等所有本地图片。图片会自动缩放到合适尺寸以加快识别速度。",
+      input: {
+        type: "object",
+        properties: {
+          image_path: S("图片文件的绝对路径（支持 png/jpg/jpeg/bmp/gif，中文路径可用）"),
+          question: S("想了解图片的什么问题（如『图例有什么』『文字内容是什么』『描述人物动作』）。不给则默认详细描述整张图"),
+        },
+        required: ["image_path"],
+      },
+      async execute(input) {
+        return { content: await recognizeImage(input.image_path, input.question?.trim() || DEFAULT_QUESTION) }
+      },
     },
-    "chat.params": async (input) => {
-      modelSupportsImage = input.model.capabilities?.input?.image === true
-      currentModelName = (input.model.name ?? input.model.id ?? "").toLowerCase()
-      // 切到本地 Ollama 模型时按需拉起服务（必须 await：等服务就绪后再发请求，否则 ECONNREFUSED）
-      if (currentModelName.includes("qwen3.5") || currentModelName.includes("ollama")) {
-        await ensureOllama().catch(() => {
-          /* 拉起失败留给请求层报连接错误 */
-        })
-      }
+    {
+      name: "local_ask",
+      description:
+        "调用本地 qwen3.5 模型处理低复杂度文本任务（翻译、摘要、分类、信息提取、格式整理、简单问答等），不消耗云端主模型配额，速度快、可离线、隐私安全。适合：批量小任务、敏感内容、主模型限流时。注意：复杂推理、长文写作、写代码等高质量任务请仍用主模型。",
+      input: {
+        type: "object",
+        properties: { prompt: S("要交给本地模型的任务指令，请包含具体上下文内容，写清楚要求") },
+        required: ["prompt"],
+      },
+      async execute(input) {
+        return { content: await askLocal(input.prompt) }
+      },
     },
-    tool: {
-      image_vision: tool({
-        description:
-          "让 DeepSeek 看懂图片：读取本地图片文件，用本地视觉模型（Ollama + qwen3.5）识别内容并返回文字描述。内置稳定性保障：Ollama 服务未运行会自动启动，调用失败会自动重启服务并重试。适用于：论文图表、截图、照片、示意图等所有本地图片。图片会自动缩放到合适尺寸以加快识别速度。",
-        args: {
-          image_path: tool.schema
-            .string()
-            .describe("图片文件的绝对路径（支持 png/jpg/jpeg/bmp/gif，中文路径可用）"),
-          question: tool.schema
-            .string()
-            .optional()
-            .describe("想了解图片的什么问题（如『图例有什么』『文字内容是什么』『描述人物动作』）。不给则默认详细描述整张图"),
-          model: tool.schema
-            .string()
-            .optional()
-            .describe("视觉模型选择（可选）：'4b'（默认，qwen3.5:4b，快速且能读出小字）"),
-        },
-        async execute(args) {
-          const imagePath = args.image_path
-          if (!fs.existsSync(imagePath)) {
-            throw new Error(`图片文件不存在：${imagePath}`)
-          }
-          const result = await recognizeImage(imagePath, args.question?.trim() || DEFAULT_QUESTION)
-          return result
-        },
-      }),
-      local_ask: tool({
-        description:
-          "调用本地 qwen3.5 模型处理低复杂度文本任务（翻译、摘要、分类、信息提取、格式整理、简单问答等），不消耗云端主模型配额，速度快、可离线、隐私安全。适合：批量小任务、敏感内容、主模型限流时。注意：复杂推理、长文写作、写代码等高质量任务请仍用主模型。",
-        args: {
-          prompt: tool.schema
-            .string()
-            .describe("要交给本地模型的任务指令，请包含具体上下文内容，写清楚要求"),
-        },
-        async execute(args) {
-          const answer = await askLocal(args.prompt)
-          return answer
-        },
-      }),
-      image_ocr: tool({
-        description:
-          "OCR 文字提取：用本地视觉模型逐字提取图片中的全部文字（论文截图、扫描页、票据、手写体等），返回纯文本。图片自动缩放以加快速度，内置 Ollama 自动启动/重启/重试保障。",
-        args: {
-          image_path: tool.schema
-            .string()
-            .describe("图片文件的绝对路径（支持 png/jpg/jpeg/bmp/gif/webp/avif，中文路径可用）"),
-        },
-        async execute(args) {
-          const imagePath = args.image_path
-          if (!fs.existsSync(imagePath)) {
-            throw new Error(`图片文件不存在：${imagePath}`)
-          }
-          const result = await recognizeImage(imagePath, PROMPT_OCR, "OCR", NUM_PREDICT_SHORT)
-          return result
-        },
-      }),
-      image_table: tool({
-        description:
-          "表格识别：用本地视觉模型把表格截图/图片转为 Markdown 表格，完整保留所有行列单元格内容。内置 Ollama 自动启动/重启/重试保障。",
-        args: {
-          image_path: tool.schema
-            .string()
-            .describe("表格图片文件的绝对路径（支持 png/jpg/jpeg/bmp/gif/webp/avif，中文路径可用）"),
-        },
-        async execute(args) {
-          const imagePath = args.image_path
-          if (!fs.existsSync(imagePath)) {
-            throw new Error(`图片文件不存在：${imagePath}`)
-          }
-          const result = await recognizeImage(imagePath, PROMPT_TABLE, "表格识别", NUM_PREDICT_SHORT)
-          return result
-        },
-      }),
-      image_chart: tool({
-        description:
-          "图表解读：用本地视觉模型分析数据图表（折线/柱状/散点/饼图等），输出图表类型、坐标轴与图例含义、主要趋势与关键数值、核心结论，可选生成 matplotlib 复现代码。内置 Ollama 自动启动/重启/重试保障。",
-        args: {
-          image_path: tool.schema
-            .string()
-            .describe("图表图片文件的绝对路径（支持 png/jpg/jpeg/bmp/gif/webp/avif，中文路径可用）"),
-          question: tool.schema
-            .string()
-            .optional()
-            .describe("想重点了解图表的哪个方面（如『两条曲线何时相交』『X 从 0 到 10 的斜率』）。不给则全面分析"),
-          want_code: tool.schema
-            .boolean()
-            .optional()
-            .describe("是否额外给出用 Python matplotlib 复现该图的代码（默认 false）"),
-        },
-        async execute(args) {
-          const imagePath = args.image_path
-          if (!fs.existsSync(imagePath)) {
-            throw new Error(`图片文件不存在：${imagePath}`)
-          }
-          const base = args.question?.trim() ? PROMPT_CHART + "\n额外关注：" + args.question.trim() : PROMPT_CHART
-          const prompt = args.want_code ? PROMPT_CHART_CODE : base
-          const result = await recognizeImage(imagePath, prompt, "图表解读")
-          return result
-        },
-      }),
-      image_pdf: tool({
-        description:
-          "PDF 识图：把 PDF 指定页面渲染成图片，再用本地视觉模型解读该页内容（标题、正文要点、表格、图表、公式）。无需安装任何软件（使用系统内置 Windows.Data.Pdf）。内置 Ollama 自动启动/重启/重试保障。",
-        args: {
-          pdf_path: tool.schema
-            .string()
-            .describe("PDF 文件的绝对路径（中文路径可用）"),
-          page: tool.schema
-            .number()
-            .optional()
-            .describe("要解读的页码，从 1 开始（默认 1）"),
-          question: tool.schema
-            .string()
-            .optional()
-            .describe("想重点了解该页的什么内容（如『摘要说了什么』『实验参数是多少』）。不给则详细描述整页"),
-        },
-        async execute(args) {
-          const pdfPath = args.pdf_path
-          if (!fs.existsSync(pdfPath)) {
-            throw new Error(`PDF 文件不存在：${pdfPath}`)
-          }
-          const pageIndex = Math.max(1, Math.floor(args.page ?? 1)) - 1
-          const { png, pageCount } = pdfToPng(pdfPath, pageIndex)
-          const prompt = args.question?.trim()
-            ? PROMPT_PDF(pageIndex + 1) + "\n额外关注：" + args.question.trim()
-            : PROMPT_PDF(pageIndex + 1)
-          const result = await recognizeImage(png, prompt, "PDF 识图")
-          return result
-        },
-      }),
+    {
+      name: "image_ocr",
+      description:
+        "OCR 文字提取：用本地视觉模型逐字提取图片中的全部文字（论文截图、扫描页、票据、手写体等），返回纯文本。图片自动缩放以加快速度，内置 Ollama 自动启动/重启/重试保障。",
+      input: {
+        type: "object",
+        properties: { image_path: S("图片文件的绝对路径（支持 png/jpg/jpeg/bmp/gif/webp/avif，中文路径可用）") },
+        required: ["image_path"],
+      },
+      async execute(input) {
+        return { content: await recognizeImage(input.image_path, PROMPT_OCR, "OCR", NUM_PREDICT_SHORT) }
+      },
     },
-    "experimental.chat.messages.transform": async (_input, output) => {
-      if (modelSupportsImage || VISION_SKIP_MODELS.some((m) => currentModelName.includes(m))) return
-      for (const message of output.messages) {
-        const imageParts: Array<{ part: Part; index: number; imagePath: string }> = []
-        const pdfParts: Array<{ part: Part; index: number; pdfPath: string }> = []
-        message.parts.forEach((part, index) => {
-          const imagePath = imagePathFromPart(part)
-          if (imagePath) {
-            imageParts.push({ part, index, imagePath })
-            return
-          }
-          const pdfPath = pdfPathFromPart(part)
-          if (pdfPath) {
-            pdfParts.push({ part, index, pdfPath })
-          }
-        })
-        const entries: Array<{ index: number; text: string }> = []
-        for (let i = 0; i < imageParts.length; i++) {
-          const item = imageParts[i]
-          const prefix = imageParts.length > 1 ? `\n--- 图片 ${i + 1} ---\n` : ""
-          try {
-            const desc = await recognizeImage(item.imagePath, DEFAULT_QUESTION)
-            entries.push({ index: item.index, text: `${prefix}${desc}` })
-          } catch (err) {
-            entries.push({
-              index: item.index,
-              text: `${prefix}【图片自动识别失败】${err instanceof Error ? err.message : String(err)}`,
-            })
-          }
-        }
-        for (let i = 0; i < pdfParts.length; i++) {
-          const item = pdfParts[i]
-          const prefix = pdfParts.length > 1 ? `\n--- PDF ${i + 1} ---\n` : ""
-          try {
-            const { png, pageCount } = pdfToPng(item.pdfPath, 0)
-            const desc = await recognizeImage(png, PROMPT_PDF(1), "PDF 识图")
-            const rest = pageCount > 1 ? `。源文件：${item.pdfPath}（共 ${pageCount} 页）——如要解读第 2-${pageCount} 页，请调用 image_pdf 工具逐页继续（参数 pdf_path + page）` : ""
-            entries.push({
-              index: item.index,
-              text: `${prefix}${desc}\n（该 PDF 还有更多页，可用 /pdf 命令指定页码继续解读${rest}）`,
-            })
-          } catch (err) {
-            entries.push({
-              index: item.index,
-              text: `${prefix}【PDF 自动识别失败】${err instanceof Error ? err.message : String(err)}`,
-            })
-          }
-        }
-        const outputParts: Part[] = []
-        for (let j = 0; j < message.parts.length; j++) {
-          const found = entries.find((e) => e.index === j)
-          if (found) {
-            outputParts.push({
-              id: (message.parts[j] as { id?: string }).id,
-              sessionID: (message.parts[j] as { sessionID?: string }).sessionID,
-              messageID: (message.parts[j] as { messageID?: string }).messageID,
-              type: "text",
-              text: found.text,
-            })
-          } else {
-            outputParts.push(message.parts[j])
-          }
-        }
-        message.parts = outputParts
-      }
+    {
+      name: "image_table",
+      description:
+        "表格识别：用本地视觉模型把表格截图/图片转为 Markdown 表格，完整保留所有行列单元格内容。内置 Ollama 自动启动/重启/重试保障。",
+      input: {
+        type: "object",
+        properties: { image_path: S("表格图片文件的绝对路径（支持 png/jpg/jpeg/bmp/gif/webp/avif，中文路径可用）") },
+        required: ["image_path"],
+      },
+      async execute(input) {
+        return { content: await recognizeImage(input.image_path, PROMPT_TABLE, "表格识别", NUM_PREDICT_SHORT) }
+      },
     },
-  }
+    {
+      name: "image_chart",
+      description:
+        "图表解读：用本地视觉模型分析数据图表（折线/柱状/散点/饼图等），输出图表类型、坐标轴与图例含义、主要趋势与关键数值、核心结论，可选生成 matplotlib 复现代码。内置 Ollama 自动启动/重启/重试保障。",
+      input: {
+        type: "object",
+        properties: {
+          image_path: S("图表图片文件的绝对路径（支持 png/jpg/jpeg/bmp/gif/webp/avif，中文路径可用）"),
+          question: S("想重点了解图表的哪个方面（如『两条曲线何时相交』『X 从 0 到 10 的斜率』）。不给则全面分析"),
+          want_code: { type: "boolean", description: "是否额外给出用 Python matplotlib 复现该图的代码（默认 false）" },
+        },
+        required: ["image_path"],
+      },
+      async execute(input) {
+        const base = input.question?.trim() ? PROMPT_CHART + "\n额外关注：" + input.question.trim() : PROMPT_CHART
+        const prompt = input.want_code ? PROMPT_CHART_CODE : base
+        return { content: await recognizeImage(input.image_path, prompt, "图表解读") }
+      },
+    },
+    {
+      name: "image_pdf",
+      description:
+        "PDF 识图：把 PDF 指定页面渲染成图片，再用本地视觉模型解读该页内容（标题、正文要点、表格、图表、公式）。无需安装任何软件（使用系统内置 Windows.Data.Pdf）。内置 Ollama 自动启动/重启/重试保障。",
+      input: {
+        type: "object",
+        properties: {
+          pdf_path: S("PDF 文件的绝对路径（中文路径可用）"),
+          page: { type: "number", description: "要解读的页码，从 1 开始（默认 1）" },
+          question: S("想重点了解该页的什么内容（如『摘要说了什么』『实验参数是多少』）。不给则详细描述整页"),
+        },
+        required: ["pdf_path"],
+      },
+      async execute(input) {
+        const pageIndex = Math.max(1, Math.floor(input.page ?? 1)) - 1
+        const { png, pageCount } = pdfToPng(input.pdf_path, pageIndex)
+        const prompt = input.question?.trim()
+          ? PROMPT_PDF(pageIndex + 1) + "\n额外关注：" + input.question.trim()
+          : PROMPT_PDF(pageIndex + 1)
+        const desc = await recognizeImage(png, prompt, "PDF 识图")
+        const rest = pageCount > 1 ? `\n（源文件共 ${pageCount} 页，如需继续解读可用 image_pdf 指定 page 参数）` : ""
+        return { content: desc + rest }
+      },
+    },
+  ]
+}
+
+export default {
+  id: "vision",
+  setup: async (ctx: any) => {
+    await ctx.tool.transform((tools: any) => {
+      for (const t of buildTools()) tools.add(t)
+    })
+  },
 }
