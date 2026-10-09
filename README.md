@@ -1,8 +1,10 @@
 # research-mentor-kit
 
-开箱即用的科研智能体套件，基于 [opencode](https://opencode.ai) 打造。
+开箱即用的科研智能体套件，基于 [opencode](https://opencode.ai) 打造，**兼容 opencode 2.x（V2 插件 API）**。
 
 包含一个完整的"私人科研导师" Agent（`research-mentor`），可调度 **25 个科研技能包**、**2 个文献检索 MCP 服务**（Paper Search MCP + CNKI 知网检索）和一个 **Ollama 视觉插件**（识图 / OCR / 表格 / 图表解读），覆盖科研全流程：选题 → 文献调研 → 方案设计 → 数据/实验 → 论文写作 → 修改润色 → 答辩准备。
+
+> **V2 迁移说明**：本仓库原 `plugins/vision.ts` 为 V1 插件 API（`export const Vision: Plugin` + `chat.params` 钩子），在 opencode 2.x 上无法加载。现已迁移为 V2 形态（`export default { id, setup }` + `ctx.tool.transform`），服务端配置同步更新为 `plugins` 数组与 `mcp.servers` 分组。
 
 ## 目录结构
 
@@ -38,7 +40,7 @@ research-mentor-kit/
 │   ├── paper-to-obsidian/          # 文献入库 Obsidian
 │   └── ...                         # 以及 context7/ppt/docx/pdf/gpt-image 等通用技能
 ├── plugins/
-│   └── vision.ts                # Ollama 视觉插件（识图/OCR/表格/图表/PDF 解读）
+│   └── vision.ts                # Ollama 视觉插件（V2 API：识图/OCR/表格/图表/PDF 解读）
 └── mcp/
     └── cnki-mcp/                # 中国知网检索 MCP 服务（Python 源码）
 ```
@@ -47,7 +49,7 @@ research-mentor-kit/
 
 | 组件 | 说明 | 获取方式 |
 |------|------|----------|
-| opencode | 智能体运行时 | `npm i -g opencode-ai` |
+| opencode | 智能体运行时（≥ 2.0） | `npm i -g opencode-ai` |
 | uv + Python ≥3.10 | Paper Search MCP 与 cnki-mcp 运行环境 | https://docs.astral.sh/uv/ |
 | Ollama | vision.ts 插件的本地视觉模型 | https://ollama.com/ ，模型如 `qwen3.5:4b` |
 | MiKTeX (Windows) / TeX Live | 论文 LaTeX 编译（xelatex） | 可选 |
@@ -65,7 +67,11 @@ cd research-mentor-kit
 
 # 2. 安装配置
 #    将 agent、skills、plugins 复制到你的 opencode 配置目录（Windows: %USERPROFILE%\.config\opencode\）
-#    或参考 config.example.jsonc 在 opencode.jsonc 中声明
+#    或参考 opencode.example.jsonc 在 opencode.jsonc 中声明
+#    V2 插件配置形态（对象形式，可带 options）：
+#    "plugins": [
+#      { "package": "./plugins/vision.ts" }
+#    ]
 
 # 3. 配置 Paper Search MCP 密钥
 cp env.example .env   # 填入你的密钥（至少 PAPER_SEARCH_MCP_UNPAYWALL_EMAIL）
